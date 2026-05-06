@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+psutil
+pywin32
+pydantic
+setuptools
+requests
+sentence-transformers
