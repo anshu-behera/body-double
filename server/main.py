@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import List, Optional
 
@@ -14,6 +15,7 @@ if ROOT_DIR not in sys.path:
 
 import storage.db as db
 from nudger.notifier import nudge
+from server import embeddings
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -22,29 +24,35 @@ db.init_db()
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 
-# Per-session overrides — cleared on session start/end
+# Per-session in-memory state
 _overrides: set = set()
+_session_embedding = None          # numpy array for the active project, or None
+_url_relevance_cache: dict = {}    # url -> bool; cleared on session start/end
 
 DISTRACTION_SITES = ["youtube.com", "twitter.com", "reddit.com", "instagram.com", "tiktok.com"]
 
 
-def _matches_entry(entry: str, url: str) -> bool:
-    """Domain entries (no ://) match any URL containing that string.
-    Page entries (with ://) match URLs that start with the stored prefix."""
-    if "://" in entry:
-        return url.startswith(entry)
-    return entry in url
-
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
 
 class Event(BaseModel):
     app: Optional[str] = None
     title: Optional[str] = None
     url: Optional[str] = None
     timestamp: float
+    meta_description: Optional[str] = None
+    headings: Optional[List[str]] = None
+    body_snippet: Optional[str] = None
 
 
 class ProjectCreate(BaseModel):
     name: str
+    description: str = ""
+
+
+class ProjectDescriptionUpdate(BaseModel):
+    description: str
 
 
 class WhitelistUpdate(BaseModel):
@@ -56,10 +64,72 @@ class SessionStart(BaseModel):
     mode: str  # "focus" | "nudge"
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _matches_entry(entry: str, url: str) -> bool:
+    """Domain entries (no ://) match any URL containing that string.
+    Page entries (with ://) match URLs that start with the stored prefix."""
+    if "://" in entry:
+        return url.startswith(entry)
+    return entry in url
+
+
+def _build_page_content(event: Event) -> str:
+    parts = [
+        event.title or "",
+        event.meta_description or "",
+        " ".join(event.headings or []),
+        event.body_snippet or "",
+    ]
+    return " ".join(p for p in parts if p).strip()
+
+
+def _precompute_embedding(description: str) -> None:
+    global _session_embedding
+    try:
+        _session_embedding = embeddings.project_embedding(description)
+    except Exception:
+        _session_embedding = None
+
+
+def _is_distracted(event: Event, session: dict) -> bool:
+    if not event.url:
+        return False
+
+    combined = db.get_global_whitelist() + session.get("project_whitelist", [])
+    if any(_matches_entry(e, event.url) for e in combined):
+        return False  # explicitly whitelisted — no further checks
+
+    page_content = _build_page_content(event)
+
+    # Semantic check — requires a project description and extracted page content
+    if _session_embedding is not None and page_content:
+        url = event.url
+        if url not in _url_relevance_cache:
+            try:
+                _url_relevance_cache[url] = embeddings.is_relevant(_session_embedding, page_content)
+            except Exception:
+                _url_relevance_cache[url] = True  # fail-open
+        return not _url_relevance_cache[url]
+
+    # Fallback: rule-based list when no semantic context is available
+    return any(site in event.url for site in DISTRACTION_SITES)
+
+
+# ---------------------------------------------------------------------------
+# Routes — UI
+# ---------------------------------------------------------------------------
+
 @app.get("/")
 def get_ui():
     return FileResponse(str(TEMPLATES_DIR / "index.html"))
 
+
+# ---------------------------------------------------------------------------
+# Routes — Projects
+# ---------------------------------------------------------------------------
 
 @app.get("/projects")
 def list_projects():
@@ -68,7 +138,7 @@ def list_projects():
 
 @app.post("/projects")
 def create_project(body: ProjectCreate):
-    return db.create_project(body.name)
+    return db.create_project(body.name, body.description)
 
 
 @app.delete("/projects/{project_id}")
@@ -83,6 +153,16 @@ def update_project_whitelist(project_id: int, body: WhitelistUpdate):
     return {"status": "ok"}
 
 
+@app.put("/projects/{project_id}/description")
+def update_project_description(project_id: int, body: ProjectDescriptionUpdate):
+    db.update_project_description(project_id, body.description)
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Routes — Global config
+# ---------------------------------------------------------------------------
+
 @app.get("/config/whitelist")
 def get_global_whitelist():
     return {"domains": db.get_global_whitelist()}
@@ -94,18 +174,36 @@ def update_global_whitelist(body: WhitelistUpdate):
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Routes — Session
+# ---------------------------------------------------------------------------
+
 @app.post("/session/start")
 def session_start(body: SessionStart):
-    global _overrides
+    global _overrides, _session_embedding, _url_relevance_cache
     _overrides = set()
+    _url_relevance_cache = {}
+    _session_embedding = None
     db.start_session(body.project_id, body.mode)
+
+    session = db.get_active_session()
+    description = session.get("project_description", "") if session else ""
+    if description and embeddings.available():
+        threading.Thread(
+            target=_precompute_embedding,
+            args=(description,),
+            daemon=True,
+        ).start()
+
     return {"status": "ok"}
 
 
 @app.post("/session/end")
 def session_end():
-    global _overrides
+    global _overrides, _session_embedding, _url_relevance_cache
     _overrides = set()
+    _url_relevance_cache = {}
+    _session_embedding = None
     db.end_session()
     return {"status": "ok"}
 
@@ -138,6 +236,28 @@ def session_override(url: str):
     _overrides.add(url)
     return {"status": "ok"}
 
+
+# ---------------------------------------------------------------------------
+# Routes — Events
+# ---------------------------------------------------------------------------
+
+@app.post("/event")
+def receive_event(event: Event):
+    db.save_event(event)
+
+    session = db.get_active_session()
+    if not session:
+        return {"status": "ok"}
+
+    if _is_distracted(event, session):
+        nudge(f"Drifting from: {session['project_name']}")
+
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Routes — Block page
+# ---------------------------------------------------------------------------
 
 @app.get("/blocked", response_class=HTMLResponse)
 def blocked_page(url: str = ""):
@@ -180,29 +300,6 @@ def blocked_page(url: str = ""):
   </script>
 </body>
 </html>"""
-
-
-@app.post("/event")
-def receive_event(event: Event):
-    db.save_event(event)
-
-    session = db.get_active_session()
-    if not session or session["mode"] != "nudge":
-        return {"status": "ok"}
-
-    if _is_distracted(event, session):
-        nudge(f"Drifting from: {session['project_name']}")
-
-    return {"status": "ok"}
-
-
-def _is_distracted(event: Event, session: dict) -> bool:
-    if not event.url:
-        return False
-    combined = db.get_global_whitelist() + session.get("project_whitelist", [])
-    if combined:
-        return not any(_matches_entry(e, event.url) for e in combined)
-    return any(site in event.url for site in DISTRACTION_SITES)
 
 
 if __name__ == "__main__":

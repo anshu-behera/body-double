@@ -107,18 +107,26 @@
       margin-bottom: 16px;
     }
 
-    select, input[type="text"] {
+    select, input[type="text"], textarea {
       background: #0a0a0a;
       border: 1px solid #1f1f1f;
       color: #e5e5e5;
       border-radius: 6px;
       padding: 8px 10px;
       font-size: 0.85rem;
+      font-family: inherit;
       outline: none;
       transition: border-color 0.12s;
     }
-    select:focus, input:focus { border-color: #3b82f6; }
+    select:focus, input:focus, textarea:focus { border-color: #3b82f6; }
     select { flex: 1; cursor: pointer; }
+
+    textarea {
+      width: 100%;
+      resize: vertical;
+      min-height: 56px;
+      line-height: 1.5;
+    }
 
     .btn {
       padding: 8px 13px;
@@ -197,6 +205,12 @@
     .add-row input { flex: 1; }
 
     .empty { font-size: 0.78rem; color: #374151; padding: 4px 0; }
+
+    .hint {
+      font-size: 0.72rem;
+      color: #374151;
+      margin-top: 5px;
+    }
 
     /* Scope dialog */
     .scope-overlay {
@@ -297,6 +311,14 @@
         <button class="btn" id="delete-project-btn" onclick="deleteProject()" style="display:none;color:#ef4444;border-color:#3a1a1a;">Delete</button>
       </div>
 
+      <div id="project-desc-section" style="display:none; margin-bottom:16px;">
+        <div class="section-label">What are you working on?</div>
+        <textarea id="project-desc" rows="2"
+          placeholder="e.g. transformer architecture, attention mechanisms, pytorch implementation"
+          oninput="scheduleDescSave()"></textarea>
+        <div class="hint">Used for semantic relevance detection when a page isn't on your whitelist.</div>
+      </div>
+
       <div class="section-label">Local whitelist</div>
       <div class="domain-list" id="local-list"></div>
       <div class="add-row">
@@ -350,6 +372,8 @@
       activeMode: 'off',
     };
 
+    let _descSaveTimer = null;
+
     async function init() {
       const [projects, session, config] = await Promise.all([
         fetch(`${API}/projects`).then(r => r.json()),
@@ -371,6 +395,7 @@
       renderModeButtons();
       renderBadge();
       renderSessionLine();
+      renderProjectDesc();
       renderLocalList();
       renderGlobalList();
     }
@@ -411,6 +436,19 @@
         el.innerHTML = `Active since <strong>${t}</strong> &mdash; <a onclick="setMode('off')">end session</a>`;
       } else {
         el.textContent = '';
+      }
+    }
+
+    function renderProjectDesc() {
+      const project = state.projects.find(p => p.id === state.selectedId);
+      const section = document.getElementById('project-desc-section');
+      const textarea = document.getElementById('project-desc');
+      if (project) {
+        section.style.display = '';
+        textarea.value = project.description || '';
+      } else {
+        section.style.display = 'none';
+        textarea.value = '';
       }
     }
 
@@ -472,6 +510,7 @@
       const val = document.getElementById('project-select').value;
       state.selectedId = val ? parseInt(val) : null;
       document.getElementById('delete-project-btn').style.display = state.selectedId ? '' : 'none';
+      renderProjectDesc();
       renderLocalList();
     }
 
@@ -484,26 +523,47 @@
       state.selectedId = null;
       document.getElementById('delete-project-btn').style.display = 'none';
       renderProjectSelect();
+      renderProjectDesc();
       renderLocalList();
     }
 
     async function newProject() {
       const name = prompt('Project name:');
       if (!name?.trim()) return;
+      const description = prompt('What will you be working on?\n(Used for semantic relevance detection — be descriptive)') || '';
       const p = await fetch(`${API}/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.trim() }),
+        body: JSON.stringify({ name: name.trim(), description: description.trim() }),
       }).then(r => r.json());
       state.projects.push(p);
       state.selectedId = p.id;
+      document.getElementById('delete-project-btn').style.display = '';
       renderProjectSelect();
+      renderProjectDesc();
       renderLocalList();
+    }
+
+    function scheduleDescSave() {
+      clearTimeout(_descSaveTimer);
+      _descSaveTimer = setTimeout(saveDescription, 800);
+    }
+
+    async function saveDescription() {
+      if (!state.selectedId) return;
+      const desc = document.getElementById('project-desc').value.trim();
+      const project = state.projects.find(p => p.id === state.selectedId);
+      if (!project || project.description === desc) return;
+      project.description = desc;
+      await fetch(`${API}/projects/${state.selectedId}/description`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: desc }),
+      });
     }
 
     // Resolve a raw input to either a domain string or a full URL string.
     // If the input has a path, shows a dialog to let the user choose.
-    // Returns a Promise resolving to the entry string, or null if cancelled.
     function resolveScope(raw) {
       let urlStr = raw.trim();
       if (!/^https?:\/\//i.test(urlStr)) urlStr = 'https://' + urlStr;
@@ -511,12 +571,10 @@
         const parsed = new URL(urlStr);
         const domain = parsed.hostname;
         const hasPath = parsed.pathname.length > 1 || parsed.search !== '' || parsed.hash !== '';
-        // Normalize: remove trailing slash, keep query and hash
         const fullUrl = parsed.href.replace(/\/$/, '');
         if (!hasPath) return Promise.resolve(domain);
         return new Promise(resolve => showScopeDialog(fullUrl, domain, resolve));
       } catch {
-        // Not parseable as URL — treat as a raw domain/substring entry
         return Promise.resolve(raw.trim().toLowerCase());
       }
     }
@@ -535,7 +593,6 @@
 
       const done = (value) => {
         overlay.classList.remove('open');
-        // Remove listeners to prevent stacking
         domainBtn.onclick = null;
         pageBtn.onclick   = null;
         cancelBtn.onclick = null;

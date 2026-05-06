@@ -6,23 +6,38 @@ async function checkUrl(url) {
     const data = await res.json();
     return data.allowed;
   } catch {
-    return true; // fail open — if server is down, don't block
+    return true; // fail-open — if server is down, don't block
   }
 }
 
-async function sendEvent(url, title) {
+async function sendEvent(url, title, content) {
   try {
     await fetch(`${SERVER}/event`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, title, timestamp: Date.now() / 1000 }),
+      body: JSON.stringify({
+        url,
+        title,
+        timestamp: Date.now() / 1000,
+        meta_description: content?.meta || null,
+        headings: content?.headings || null,
+        body_snippet: content?.bodySnippet || null,
+      }),
     });
   } catch {}
 }
 
-// webNavigation fires on every navigation before the page loads — more reliable than onUpdated
+// Content script sends page content once the page is idle; forward it as an event
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg.type !== "PAGE_EVENT" || !sender.tab) return;
+  const { url, title } = sender.tab;
+  if (!url?.startsWith("http") || url.startsWith(SERVER)) return;
+  sendEvent(url, title, msg.data);
+});
+
+// Block disallowed navigations before the page loads (focus mode)
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
-  if (details.frameId !== 0) return; // main frame only, ignore iframes
+  if (details.frameId !== 0) return; // main frame only
   const url = details.url;
   if (!url.startsWith("http") || url.startsWith(SERVER)) return;
 
@@ -34,10 +49,9 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   }
 });
 
-// Track active tab switches for nudge mode
+// Send a lightweight event (no page content) on tab switch
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   const tab = await chrome.tabs.get(activeInfo.tabId);
-  if (tab.url && tab.url.startsWith("http")) {
-    sendEvent(tab.url, tab.title);
-  }
+  if (!tab.url?.startsWith("http") || tab.url.startsWith(SERVER)) return;
+  sendEvent(tab.url, tab.title, null);
 });

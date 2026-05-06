@@ -18,6 +18,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
+                description TEXT DEFAULT '',
                 whitelist TEXT DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS config (
@@ -43,18 +44,37 @@ def init_db():
         conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('global_whitelist', '[]')")
         conn.commit()
 
+    # Migrate: add description column if upgrading from an older schema
+    try:
+        with _conn() as conn:
+            conn.execute("ALTER TABLE projects ADD COLUMN description TEXT DEFAULT ''")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
 
 def get_projects():
     with _conn() as conn:
-        rows = conn.execute("SELECT id, name, whitelist FROM projects").fetchall()
-        return [{"id": r["id"], "name": r["name"], "whitelist": json.loads(r["whitelist"])} for r in rows]
+        rows = conn.execute("SELECT id, name, description, whitelist FROM projects").fetchall()
+        return [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "description": r["description"] or "",
+                "whitelist": json.loads(r["whitelist"]),
+            }
+            for r in rows
+        ]
 
 
-def create_project(name: str):
+def create_project(name: str, description: str = ""):
     with _conn() as conn:
-        cursor = conn.execute("INSERT INTO projects (name) VALUES (?)", (name,))
+        cursor = conn.execute(
+            "INSERT INTO projects (name, description) VALUES (?, ?)",
+            (name, description),
+        )
         conn.commit()
-        return {"id": cursor.lastrowid, "name": name, "whitelist": []}
+        return {"id": cursor.lastrowid, "name": name, "description": description, "whitelist": []}
 
 
 def delete_project(project_id: int):
@@ -65,7 +85,19 @@ def delete_project(project_id: int):
 
 def update_project_whitelist(project_id: int, domains: list):
     with _conn() as conn:
-        conn.execute("UPDATE projects SET whitelist = ? WHERE id = ?", (json.dumps(domains), project_id))
+        conn.execute(
+            "UPDATE projects SET whitelist = ? WHERE id = ?",
+            (json.dumps(domains), project_id),
+        )
+        conn.commit()
+
+
+def update_project_description(project_id: int, description: str):
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE projects SET description = ? WHERE id = ?",
+            (description, project_id),
+        )
         conn.commit()
 
 
@@ -79,7 +111,7 @@ def update_global_whitelist(domains: list):
     with _conn() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO config (key, value) VALUES ('global_whitelist', ?)",
-            (json.dumps(domains),)
+            (json.dumps(domains),),
         )
         conn.commit()
 
@@ -87,7 +119,7 @@ def update_global_whitelist(domains: list):
 def get_active_session():
     with _conn() as conn:
         row = conn.execute("""
-            SELECT s.id, s.project_id, s.mode, s.started_at, p.name, p.whitelist
+            SELECT s.id, s.project_id, s.mode, s.started_at, p.name, p.description, p.whitelist
             FROM sessions s
             LEFT JOIN projects p ON s.project_id = p.id
             WHERE s.ended_at IS NULL
@@ -101,6 +133,7 @@ def get_active_session():
             "mode": row["mode"],
             "started_at": row["started_at"],
             "project_name": row["name"],
+            "project_description": row["description"] or "",
             "project_whitelist": json.loads(row["whitelist"]) if row["whitelist"] else [],
         }
 
